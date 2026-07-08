@@ -4329,14 +4329,19 @@ ${p.toolCode
         },
 
         // ── foundry_crystallize ─────────────────────────────────────────────────
-        // HexMachina (arXiv:2506.04651): LLM-driven crystallization
-        // Returns pattern context and asks LLM to generate hook code
+        // HexMachina (arXiv:2506.04651): atomic LLM-driven crystallization.
+        // Calls the configured LLM, writes the generated hook to disk, and
+        // marks the pattern crystallized — all in one tool call. The previous
+        // 2-step design ("return template → ask caller to call save_hook") was
+        // broken in llm-task subagent contexts (4 empirical tests failed).
         {
           name: "foundry_crystallize",
           label: "Crystallize Pattern",
           description:
-            "Start crystallization of a learned pattern. Returns pattern details and instructions " +
-            "for generating hook code. After reviewing, call foundry_save_hook with the generated code.",
+            "Crystallize a learned pattern into a permanent before_tool_call hook. " +
+            "Atomically calls the LLM to generate hook code, writes it to disk under " +
+            "~/.openclaw/foundry/hooks/, and marks the pattern as crystallized. " +
+            "Requires an LLM API key (ANTHROPIC_API_KEY or foundry config llmApiKey).",
           parameters: {
             type: "object" as const,
             properties: {
@@ -4382,44 +4387,118 @@ ${p.toolCode
               };
             }
 
-            // HexMachina: Return context for LLM to generate the hook
-            let output = `## Crystallize Pattern: ${pattern.id}\n\n`;
-            output += `### Pattern Details\n`;
-            output += `- **Tool**: \`${pattern.tool}\`\n`;
-            output += `- **Error Pattern**: ${pattern.error}\n`;
-            output += `- **Learned Resolution**: ${pattern.resolution}\n`;
-            output += `- **Context**: ${pattern.context || "N/A"}\n`;
-            output += `- **Use Count**: ${pattern.useCount}\n`;
-            output += `- **Success Trajectory**: ${(pattern.improvementTrajectory || []).join(", ") || "N/A"}\n\n`;
+            // ── Build a focused prompt for the LLM ─────────────────────────────
+            const systemPrompt =
+              `You generate OpenClaw before_tool_call hooks that proactively ` +
+              `prevent known tool failures.\n\n` +
+              `Rules:\n` +
+              `- Hook signature: api.on("before_tool_call", async (event, ctx) => { ... })\n` +
+              `- Trigger only when event.toolName matches the target tool\n` +
+              `- Inspect event.params (event.params is the arguments object) to detect the condition that would cause the error\n` +
+              `- When detected, call ctx.injectSystemMessage(...) with a short, specific reminder\n` +
+              `- Return code only — no markdown fences, no prose, no explanation\n` +
+              `- Keep it minimal and TypeScript-clean\n` +
+              `- Prefer injection over mutation; never throw or block the call`;
 
-            output += `### Generate Hook Code\n\n`;
-            output += `Create a \`before_tool_call\` hook that:\n`;
-            output += `1. Triggers when \`${pattern.tool}\` is about to be called\n`;
-            output += `2. Detects conditions that would lead to: "${pattern.error?.slice(0, 100)}"\n`;
-            output += `3. Applies the resolution proactively: "${pattern.resolution}"\n`;
-            output += `4. Uses \`ctx.injectSystemMessage()\` to guide the LLM\n\n`;
+            const userPrompt =
+              `Pattern ID: ${pattern.id}\n` +
+              `Tool: ${pattern.tool}\n` +
+              `Error pattern: ${pattern.error}\n` +
+              `Learned resolution: ${pattern.resolution}\n` +
+              `Context: ${pattern.context || "N/A"}\n` +
+              `Use count: ${pattern.useCount}\n\n` +
+              `Generate a complete TypeScript hook handler body (the function passed ` +
+              `to api.on("before_tool_call", ...)) that:\n` +
+              `1. Triggers when the "${pattern.tool}" tool is about to be called\n` +
+              `2. Inspects event.params to detect when this error would occur: "${(pattern.error || "").slice(0, 200)}"\n` +
+              `3. Calls ctx.injectSystemMessage() with the resolution: "${(pattern.resolution || "").slice(0, 200)}"\n` +
+              `4. Returns cleanly (does not block or throw)\n\n` +
+              `Respond with ONLY the raw TypeScript code — no markdown fences, no explanation.`;
 
-            output += `### Hook Template\n`;
-            output += `\`\`\`typescript\n`;
-            output += `api.on("before_tool_call", async (event, ctx) => {\n`;
-            output += `  if (event.toolName === "${pattern.tool}") {\n`;
-            output += `    // TODO: Add detection logic for the error condition\n`;
-            output += `    // TODO: Apply resolution proactively\n`;
-            output += `    if (ctx?.injectSystemMessage) {\n`;
-            output += `      ctx.injectSystemMessage(\`[CRYSTALLIZED] Apply: ${pattern.resolution?.slice(0, 100)}\`);\n`;
-            output += `    }\n`;
-            output += `  }\n`;
-            output += `});\n`;
-            output += `\`\`\`\n\n`;
+            // ── Call the LLM ──────────────────────────────────────────────────
+            let hookCode = "";
+            try {
+              const { AnthropicLLMClient, resolveLLMConfig } = await import(
+                "./src/llm-client.js"
+              );
+              const llm = new AnthropicLLMClient(
+                resolveLLMConfig(cfg as any),
+              );
+              const raw = await llm.complete(userPrompt, systemPrompt);
+              hookCode = (raw || "").trim();
 
-            output += `### Next Step\n`;
-            output += `Generate the complete hook code based on the pattern above, then call:\n`;
-            output += `\`\`\`\n`;
-            output += `foundry_save_hook(\n`;
-            output += `  patternId: "${pattern.id}",\n`;
-            output += `  hookCode: "<your generated code>"\n`;
-            output += `)\n`;
-            output += `\`\`\`\n`;
+              // Strip markdown fences if the LLM wrapped it anyway
+              const fence = hookCode.match(
+                /```(?:typescript|ts|js)?\s*([\s\S]*?)```/i,
+              );
+              if (fence) hookCode = fence[1].trim();
+              // Drop a leading "Here is the code:" style preamble if present
+              hookCode = hookCode
+                .replace(/^Here[^\n]*?:\s*\n/i, "")
+                .replace(/^Sure[^\n]*?:\s*\n/i, "")
+                .trim();
+            } catch (err: any) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      `Crystallize failed at the LLM step: ${err?.message || err}\n\n` +
+                      `The pattern is preserved (NOT marked crystallized).\n` +
+                      `Fix the LLM config (ANTHROPIC_API_KEY / foundry.llmApiKey) and retry, ` +
+                      `or call foundry_save_hook manually with hand-written hook code.`,
+                  },
+                ],
+              };
+            }
+
+            // ── Validate basic structure ──────────────────────────────────────
+            if (
+              !hookCode ||
+              (!hookCode.includes("api.on") &&
+                !hookCode.includes("event") &&
+                !hookCode.includes("ctx"))
+            ) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      `LLM returned code without expected hook structure (api.on / event / ctx).\n\n` +
+                      `Raw response (first 800 chars):\n\`\`\`\n${hookCode.slice(0, 800)}\n\`\`\`\n\n` +
+                      `The pattern is preserved. Retry, or call foundry_save_hook manually.`,
+                  },
+                ],
+              };
+            }
+
+            // ── Write the hook file ────────────────────────────────────────────
+            const hookId = `crystallized_${pattern.tool}_${Date.now()}`;
+            const hooksDir = join(dataDir, "hooks");
+            if (!existsSync(hooksDir)) mkdirSync(hooksDir, { recursive: true });
+
+            const hookPath = join(hooksDir, `${hookId}.ts`);
+            const fullCode =
+              `// HexMachina crystallized from pattern: ${pattern.id}\n` +
+              `// Tool: ${pattern.tool}\n` +
+              `// Error: ${(pattern.error || "").slice(0, 200)}\n` +
+              `// Resolution: ${(pattern.resolution || "").slice(0, 200)}\n` +
+              `// Generated by foundry_crystallize (atomic mode)\n\n` +
+              `${hookCode}\n`;
+            writeFileSync(hookPath, fullCode);
+            learningEngine.markCrystallized(p.patternId, hookId);
+
+            logger?.info?.(
+              `[foundry] Crystallized ${pattern.id} → ${hookId} (atomic)`,
+            );
+
+            let output = `## Hook Crystallized ✅\n\n`;
+            output += `**Pattern**: ${pattern.id}\n`;
+            output += `**Hook ID**: ${hookId}\n`;
+            output += `**Path**: ${hookPath}\n\n`;
+            output += `### Generated Code\n\n`;
+            output += `\`\`\`typescript\n${hookCode}\n\`\`\`\n\n`;
+            output += `Pattern marked crystallized. Run \`foundry_restart\` to activate the hook.`;
 
             return { content: [{ type: "text", text: output }] };
           },
