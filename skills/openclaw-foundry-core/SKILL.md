@@ -1,5 +1,6 @@
 ---
-name: foundry
+name: openclaw-foundry-core
+id: openclaw-foundry-core
 description: Self-writing meta-extension that forges new capabilities — researches docs, writes extensions, tools, hooks, and skills
 homepage: https://github.com/xdemocle/openclaw-foundry-core
 user-invocable: true

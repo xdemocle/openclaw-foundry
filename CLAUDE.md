@@ -23,15 +23,15 @@ foundry_meta_search      — ADAS: LLM designs + scores novel agents (needs LLM 
 foundry_self_write       — Write a tool/hook/technique to the self-written store
 ```
 
-> The list above is the curated set. index.ts **defines 25** tool objects (grep
-> `name: "foundry_`), but only **23 are actually registered** — the `toolNames` array at
-> the `api.registerTool(tools, { names: toolNames })` call (index.ts ~line 5354) omits
-> **`foundry_write_browser_skill`** and **`foundry_write_hook`**, so they exist as code but
-> are never exposed. This is why the gateway startup log says `23 tools`, not 25. (If you
-> need either tool live, add its name to that `toolNames` array — don't just trust the
-> `name:` grep count.) The non-curated registered tools are the Learning/Overseer surface:
-> `foundry_overseer`, `foundry_crystallize`, `foundry_save_hook`, `foundry_metrics`,
-> `foundry_evolve`, `foundry_track_outcome`, `foundry_record_feedback`,
+> All **25** tool objects defined in index.ts (grep `name: "foundry_`) are now registered,
+> including `foundry_write_browser_skill` and `foundry_write_hook` (fixed since an earlier
+> version of this doc). Registration is **not** a single batch call — the runtime rejects
+> an array-returning tool factory (`"plugin must declare contracts.tools before registering
+> agent tools"`), so `register(api)` (index.ts ~line 5433) builds the `toolNames` allowlist,
+> materializes the tool list once, then calls `api.registerTool(tool, { name: tool.name })`
+> **per tool** in a loop (index.ts:5469-5474). The non-curated registered tools are the
+> Learning/Overseer surface: `foundry_overseer`, `foundry_crystallize`, `foundry_save_hook`,
+> `foundry_metrics`, `foundry_evolve`, `foundry_track_outcome`, `foundry_record_feedback`,
 > `foundry_get_insights`, `foundry_pending_feedback`, `foundry_apply_improvement`.
 
 > **LLM-backed features** (`foundry_meta_search`) need an API key: set `ANTHROPIC_API_KEY`
@@ -89,7 +89,7 @@ these classes (line numbers drift — grep for `class <Name>`):
 | `CodeWriter` (index.ts) | Generates extensions/skills/hooks from templates, writes to `~/.openclaw/...` |
 | `LearningEngine` (index.ts) | Records failures/resolutions → patterns; runs the hourly Overseer |
 | `CodeValidator` (index.ts) | Static security scan + isolated-process sandbox validation |
-| `register(api)` (index.ts, ~line 5380) | Plugin entry: `api.registerTool(tools, {names})` for the `foundry_*` tools named in the `toolNames` array (23 of the 25 defined — see the tool-count note above), plus two real hooks — `api.on("before_tool_call")` (learning capture) and `api.on("before_agent_start")` (context injection). The `command:new`/`gateway:startup` events elsewhere in these docs are for *generated* hooks, not Foundry's own. |
+| `register(api)` (index.ts, ~line 5433) | Plugin entry: builds the `toolNames` allowlist (all 25 `foundry_*` tools — see the tool-count note above), then calls `api.registerTool(tool, {name})` per tool in a loop, plus two real hooks — `api.on("before_tool_call")` (learning capture) and `api.on("before_agent_start")` (context injection). The `command:new`/`gateway:startup` events elsewhere in these docs are for *generated* hooks, not Foundry's own. |
 
 Helper modules in **`src/`** are **lazy-loaded at call time** via `await import("./src/<name>.js")`
 (note the `.js` specifier even though sources are `.ts`):
@@ -414,117 +414,12 @@ Enable with: `openclaw hooks enable welcome-message`
 
 ## Publishing Extensions
 
-### npm Publishing
-
-1. **Setup package.json** for npm:
-```json
-{
-  "name": "openclaw-foundry-core",
-  "version": "0.2.0",
-  "repository": { "type": "git", "url": "https://github.com/xdemocle/openclaw-foundry-core" },
-  "moltbot": { "extensions": ["./index.ts"] },
-  "openclaw": { "extensions": ["./index.ts"] },
-  "peerDependencies": { "moltbot": "*", "openclaw": "*" },
-  "peerDependenciesMeta": { "moltbot": { "optional": true }, "openclaw": { "optional": true } }
-}
-```
-
-2. **Create .npmignore** to reduce package size:
-```
-assets/
-server/
-.git/
-*.tsbuildinfo
-flake.nix
-flake.lock
-HN_POST.md
-REDDIT_POST.md
-```
-
-3. **Set npm token** (needs 2FA bypass for automation):
-```bash
-npm config set //registry.npmjs.org/:_authToken=npm_YOUR_TOKEN_HERE
-```
-
-4. **Publish**:
-```bash
-npm publish --access public
-```
-
-### ClawHub Publishing
-
-1. **Create skills/PLUGIN_NAME/SKILL.md** with frontmatter:
-```yaml
----
-name: plugin-name
-description: What it does
-homepage: https://example.com
-user-invocable: false
-metadata: {"openclaw":{"requires":{"bins":["node"]},"repository":"github:user/repo"}}
----
-```
-
-2. **Install clawhub CLI**:
-```bash
-bun add -g clawhub
-export PATH="$HOME/.bun/bin:$PATH"
-```
-
-3. **Login and publish**:
-```bash
-clawhub login
-clawhub publish skills/plugin-name --slug plugin-name --name "Plugin Name" --version 0.1.0 --tags latest
-```
-
-### Nix Flake (Optional)
-
-1. **Create flake.nix** with `buildNpmPackage`:
-```nix
-{
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system: {
-      packages.default = pkgs.buildNpmPackage {
-        pname = "plugin-name";
-        version = "0.1.0";
-        src = ./.;
-        npmDepsHash = "sha256-PLACEHOLDER";  # Run nix build to get correct hash
-        makeCacheWritable = true;  # Fix npm cache issues
-        nodejs = pkgs.nodejs_22;
-      };
-      openclawPlugin = {
-        name = "plugin-name";
-        skills = [ "${self.packages.${system}.default}/lib/openclaw/skills/plugin-name" ];
-        needs = { stateDirs = []; requiredEnv = []; };
-      };
-    });
-}
-```
-
-2. **Build and get hash**:
-```bash
-nix build 2>&1 | grep "got:"  # Copy the sha256 hash
-# Update flake.nix with correct hash, then:
-nix build  # Should succeed
-```
-
-### Installation Options (Document in README)
-
-```markdown
-## Installation
-
-### Just Ask
-"Install the Plugin Name plugin"
-
-### npm (Recommended)
-npm install -g @scope/plugin-name
-
-### GitHub Source
-{ "plugins": { "entries": { "plugin-name": { "enabled": true, "source": "github:user/repo" } } } }
-
-### Nix
-nix run github:user/repo
-
-### Manual
-git clone https://github.com/user/repo ~/.openclaw/extensions/plugin-name
-cd ~/.openclaw/extensions/plugin-name && npm install
-```
+- **npm**: bump `package.json` version, `npm publish --access public`. Keep the three
+  manifests (`package.json`, `openclaw.plugin.json`, `clawdbot.plugin.json`) in sync per
+  the version-drift note above.
+- **ClawHub**: `bun add -g clawhub` → `clawhub login` → `clawhub publish skills/<name>
+  --slug <name> --name "<Name>" --version <ver> --tags latest` (needs a `SKILL.md` with
+  frontmatter under `skills/<name>/`).
+- **Nix flake**: optional, uses `buildNpmPackage`; only relevant if distributing via Nix.
+- **Manual install**: `git clone <repo> ~/.openclaw/extensions/<name> && npm install`, or
+  via `plugins.entries.<name>.source: "github:user/repo"` in config.
